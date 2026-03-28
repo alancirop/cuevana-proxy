@@ -9,21 +9,76 @@ import os
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Cuevana Proxy", version="1.0.0")
+app = FastAPI(title="Cuevana Proxy", version="2.0.0")
 
-# ── Estado del proxy ──────────────────────────────────────
-class ProxyState:
-    cf_clearance: str = os.getenv("CF_CLEARANCE", "")
-    last_updated: datetime = datetime.now()
+BASE_URL        = "https://cuevana.gs/wp-api/v1"
+FLARESOLVERR   = os.getenv("FLARESOLVERR_URL", "http://localhost:8191")
+ADMIN_SECRET   = os.getenv("ADMIN_SECRET", "tvfamiliar2026")
+
+# ── Estado ────────────────────────────────────────────────
+class State:
+    cf_clearance: str = ""
+    user_agent: str   = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    last_renewed: datetime = datetime.min
+    renewing: bool    = False
     request_count: int = 0
 
-state = ProxyState()
+state = State()
 
-BASE_URL = "https://cuevana.gs/wp-api/v1"
+# ── Renovar cookie via FlareSolverr ──────────────────────
+async def renovar_cookie() -> bool:
+    if state.renewing:
+        logger.info("Ya renovando, esperando...")
+        for _ in range(30):
+            await asyncio.sleep(1)
+            if not state.renewing:
+                break
+        return bool(state.cf_clearance)
 
-def get_headers() -> dict:
+    state.renewing = True
+    logger.info("🔄 Renovando cf_clearance via FlareSolverr...")
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.post(f"{FLARESOLVERR}/v1", json={
+                "cmd": "request.get",
+                "url": "https://cuevana.gs/wp-api/v1/listing/movies?page=1&postsPerPage=1",
+                "maxTimeout": 60000
+            })
+            data = resp.json()
+            logger.info(f"FlareSolverr status: {data.get('status')}")
+
+            if data.get("status") == "ok":
+                solution = data.get("solution", {})
+                cookies  = solution.get("cookies", [])
+                ua       = solution.get("userAgent", state.user_agent)
+
+                cf = next((c["value"] for c in cookies if c["name"] == "cf_clearance"), "")
+                if cf:
+                    state.cf_clearance = cf
+                    state.user_agent   = ua
+                    state.last_renewed = datetime.now()
+                    logger.info(f"✅ cf_clearance renovada: {cf[:30]}...")
+                    state.renewing = False
+                    return True
+                else:
+                    logger.warning("⚠️ FlareSolverr no devolvió cf_clearance")
+            else:
+                logger.error(f"❌ FlareSolverr error: {data.get('message')}")
+    except Exception as e:
+        logger.error(f"❌ Error FlareSolverr: {e}")
+
+    state.renewing = False
+    return False
+
+async def get_headers() -> dict:
+    # Renovar si expiró (cada 20 horas)
+    edad = datetime.now() - state.last_renewed
+    if not state.cf_clearance or edad > timedelta(hours=20):
+        logger.info("Cookie expirada o vacía, renovando...")
+        await renovar_cookie()
+
     return {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36",
+        "User-Agent": state.user_agent,
         "Referer": "https://cuevana.gs/peliculas/",
         "Accept": "*/*",
         "Accept-Language": "es-US,es-419;q=0.9,es;q=0.8",
@@ -35,24 +90,40 @@ def get_headers() -> dict:
 
 async def fetch_cuevana(url: str) -> dict:
     state.request_count += 1
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.get(url, headers=get_headers())
+    headers = await get_headers()
+
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        resp = await client.get(url, headers=headers)
         logger.info(f"GET {url} → HTTP {resp.status_code}")
+
         if resp.status_code == 403:
-            raise HTTPException(status_code=403, detail="Cookie expirada — actualizá CF_CLEARANCE en Railway")
+            # Cookie expirada — renovar y reintentar
+            logger.warning("403 detectado — renovando cookie...")
+            state.cf_clearance = ""  # forzar renovación
+            headers = await get_headers()
+            async with httpx.AsyncClient(timeout=20.0) as client2:
+                resp = await client2.get(url, headers=headers)
+                logger.info(f"Reintento → HTTP {resp.status_code}")
+                if resp.status_code != 200:
+                    raise HTTPException(status_code=resp.status_code, detail="Error después de renovar cookie")
+
         if resp.status_code != 200:
             raise HTTPException(status_code=resp.status_code, detail="Error de cuevana")
+
         return resp.json()
 
 # ── Endpoints ─────────────────────────────────────────────
 
 @app.get("/")
 async def root():
+    edad = datetime.now() - state.last_renewed
     return {
         "status": "ok",
         "cf_clearance_set": bool(state.cf_clearance),
-        "last_updated": state.last_updated.isoformat(),
+        "cookie_age_minutes": int(edad.total_seconds() / 60) if state.cf_clearance else -1,
+        "last_renewed": state.last_renewed.isoformat(),
         "requests_total": state.request_count,
+        "flaresolverr": FLARESOLVERR,
     }
 
 @app.get("/listing/{tipo}")
@@ -77,35 +148,14 @@ async def search(
     return await fetch_cuevana(url)
 
 @app.get("/player")
-async def player(
-    postId: int = Query(...),
-    demo: int = Query(0)
-):
+async def player(postId: int = Query(...), demo: int = Query(0)):
     url = f"{BASE_URL}/player?postId={postId}&demo={demo}"
     return await fetch_cuevana(url)
 
-@app.get("/sliders")
-async def sliders(
-    page: int = Query(1),
-    postType: str = Query("movies"),
-    postsPerPage: int = Query(6)
-):
-    url = f"{BASE_URL}/sliders?page={page}&postType={postType}&postsPerPage={postsPerPage}"
-    return await fetch_cuevana(url)
-
-# ── Actualizar cookie via API (protegida con secret) ──────
-@app.post("/update-cookie")
-async def update_cookie(
-    cookie: str = Query(...),
-    secret: str = Query(...)
-):
-    expected = os.getenv("ADMIN_SECRET", "cambiar-esto")
-    if secret != expected:
-        raise HTTPException(status_code=401, detail="Secret inválido")
-    state.cf_clearance = cookie
-    state.last_updated = datetime.now()
-    logger.info(f"✅ Cookie actualizada: {cookie[:30]}...")
-    return {"status": "ok", "updated_at": state.last_updated.isoformat()}
+@app.on_event("startup")
+async def startup():
+    logger.info("🚀 Servidor iniciado — renovando cookie inicial...")
+    asyncio.create_task(renovar_cookie())
 
 if __name__ == "__main__":
     import uvicorn

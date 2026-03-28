@@ -1,18 +1,18 @@
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import JSONResponse
 import httpx
 import asyncio
 import logging
-from datetime import datetime
+from urllib.parse import quote
 import os
+import json
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Cuevana Proxy", version="3.0.0")
 
-BASE_URL      = "https://cuevana.gs/wp-api/v1"
-FLARESOLVERR  = os.getenv("FLARESOLVERR_URL", "http://localhost:8191")
+BASE_URL     = "https://cuevana.gs/wp-api/v1"
+FLARESOLVERR = os.getenv("FLARESOLVERR_URL", "http://localhost:8191")
 
 class State:
     request_count: int = 0
@@ -20,44 +20,45 @@ class State:
 state = State()
 
 async def fetch_via_flaresolverr(url: str) -> dict:
-    """Hace TODAS las requests a través de FlareSolverr para evitar bloqueos de IP"""
+    """Todas las requests van 100% a traves de FlareSolverr con Chrome real"""
     state.request_count += 1
     logger.info(f"FlareSolverr GET: {url}")
-    
-    async with httpx.AsyncClient(timeout=60.0) as client:
+
+    async with httpx.AsyncClient(timeout=90.0) as client:
         resp = await client.post(f"{FLARESOLVERR}/v1", json={
             "cmd": "request.get",
             "url": url,
             "maxTimeout": 60000
         })
         data = resp.json()
-        
+        logger.info(f"FlareSolverr status: {data.get('status')}")
+
         if data.get("status") != "ok":
             logger.error(f"FlareSolverr error: {data.get('message')}")
             raise HTTPException(status_code=502, detail=f"FlareSolverr error: {data.get('message')}")
-        
+
         solution = data.get("solution", {})
-        status   = solution.get("status", 0)
-        body     = solution.get("response", "")
-        
-        logger.info(f"FlareSolverr → HTTP {status}")
-        
-        if status != 200:
-            raise HTTPException(status_code=status, detail="Error de cuevana via FlareSolverr")
-        
-        import json
+        http_status = solution.get("status", 0)
+        body = solution.get("response", "")
+
+        logger.info(f"HTTP status desde cuevana: {http_status}")
+
+        if http_status not in (200, 201):
+            raise HTTPException(status_code=http_status, detail=f"Error de cuevana: {http_status}")
+
         try:
             return json.loads(body)
-        except:
-            raise HTTPException(status_code=502, detail="Respuesta inválida de cuevana")
+        except Exception as e:
+            logger.error(f"JSON parse error: {e} — body[:200]: {body[:200]}")
+            raise HTTPException(status_code=502, detail="Respuesta invalida de cuevana")
 
 @app.get("/")
 async def root():
     return {
         "status": "ok",
-        "requests_total": state.request_count,
+        "mode": "flaresolverr_full_proxy",
         "flaresolverr": FLARESOLVERR,
-        "mode": "full_proxy"
+        "requests_total": state.request_count,
     }
 
 @app.get("/listing/{tipo}")
@@ -77,7 +78,6 @@ async def search(
     q: str = Query(...),
     postsPerPage: int = Query(50)
 ):
-    from urllib.parse import quote
     url = f"{BASE_URL}/search?postType={postType}&q={quote(q)}&postsPerPage={postsPerPage}"
     return await fetch_via_flaresolverr(url)
 

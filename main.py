@@ -1,15 +1,15 @@
 from fastapi import FastAPI, HTTPException, Query
 import httpx
-import asyncio
 import logging
 from urllib.parse import quote
 import os
 import json
+import re
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Cuevana Proxy", version="3.0.0")
+app = FastAPI(title="Cuevana Proxy", version="4.0.0")
 
 BASE_URL     = "https://cuevana.gs/wp-api/v1"
 FLARESOLVERR = os.getenv("FLARESOLVERR_URL", "http://localhost:8191")
@@ -19,8 +19,34 @@ class State:
 
 state = State()
 
+def extract_json(body: str) -> dict:
+    """Extrae JSON del body aunque venga envuelto en HTML de FlareSolverr"""
+    # Intentar parsear directo
+    try:
+        return json.loads(body)
+    except:
+        pass
+
+    # Buscar JSON dentro del HTML — FlareSolverr a veces lo envuelve en <pre>
+    match = re.search(r'<pre[^>]*>(.*?)</pre>', body, re.DOTALL)
+    if match:
+        try:
+            return json.loads(match.group(1))
+        except:
+            pass
+
+    # Buscar el primer { hasta el ultimo }
+    start = body.find('{')
+    end   = body.rfind('}')
+    if start != -1 and end != -1:
+        try:
+            return json.loads(body[start:end+1])
+        except:
+            pass
+
+    raise ValueError(f"No se pudo extraer JSON del body: {body[:200]}")
+
 async def fetch_via_flaresolverr(url: str) -> dict:
-    """Todas las requests van 100% a traves de FlareSolverr con Chrome real"""
     state.request_count += 1
     logger.info(f"FlareSolverr GET: {url}")
 
@@ -34,22 +60,21 @@ async def fetch_via_flaresolverr(url: str) -> dict:
         logger.info(f"FlareSolverr status: {data.get('status')}")
 
         if data.get("status") != "ok":
-            logger.error(f"FlareSolverr error: {data.get('message')}")
             raise HTTPException(status_code=502, detail=f"FlareSolverr error: {data.get('message')}")
 
-        solution = data.get("solution", {})
+        solution    = data.get("solution", {})
         http_status = solution.get("status", 0)
-        body = solution.get("response", "")
+        body        = solution.get("response", "")
 
-        logger.info(f"HTTP status desde cuevana: {http_status}")
+        logger.info(f"HTTP status cuevana: {http_status}")
 
         if http_status not in (200, 201):
-            raise HTTPException(status_code=http_status, detail=f"Error de cuevana: {http_status}")
+            raise HTTPException(status_code=http_status, detail=f"Error cuevana: {http_status}")
 
         try:
-            return json.loads(body)
+            return extract_json(body)
         except Exception as e:
-            logger.error(f"JSON parse error: {e} — body[:200]: {body[:200]}")
+            logger.error(f"JSON error: {e}")
             raise HTTPException(status_code=502, detail="Respuesta invalida de cuevana")
 
 @app.get("/")
